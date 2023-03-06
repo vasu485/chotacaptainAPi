@@ -47,6 +47,7 @@ Route::group([], function ()  //'middleware' => ['']
 	Route::get('locations', 'Admin\AdminController@getLocations');
 	Route::get('partnerlocations', 'Admin\AdminController@getPartnerLocations');
 	Route::put('locations/update', 'Admin\AdminController@updateLocations');
+	Route::put('locations/updatePartnerLocation', 'Admin\AdminController@updatePartnersLocation');
 	Route::post('locations/create', 'Admin\AdminController@createLocations');
 	Route::post('Partnerlocations/create', 'Admin\AdminController@createPartner');
 

@@ -1003,6 +1003,35 @@ class AdminController extends Controller
 
         return $this->sendResponse("Location updated successfully...!",null);
     }
+    public function updatePartnersLocation(Request $request)
+    {
+        //start validations
+        $validator = Validator::make($request->all(), ['id' =>'required|numeric','name' => 'required|string']);
+        if ($validator->fails()) {
+            return $this->sendBadException(implode(',',$validator->errors()->all()),null);
+        }
+
+        $loc = PartnerLocation::find($request->id);
+        if($loc==null){
+            return $this->sendBadException('Location not found',null);
+        }
+
+        //logged user
+        $user = JWTAuth::parseToken()->authenticate();
+        if($user->user_role!='ADMIN' && $user->user_role!='EDITOR' && $user->user_role!='OPERATOR'){
+            return response()->json(["status"=>"error","message"=>"Sorry, You are not authorised to update.",'data' => null],401);
+        }
+
+        if(isset($request->name) && $request->name!=null){
+            $loc->name = trim($request->name);
+        }
+        $loc->lat=$request->lat;
+        $loc->lon=$request->lon;
+        
+        $loc->update();
+
+        return $this->sendResponse("Partner Location updated successfully...!",null);
+    }
 
     public function createLocations(Request $request)
     {
