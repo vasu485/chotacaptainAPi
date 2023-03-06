@@ -1,0 +1,882 @@
+<?php
+
+namespace App\Http\Controllers;
+use Illuminate\Http\Request;
+use App\Http\Requests;
+use App\Http\Controllers\Controller;
+use Illuminate\Support\Facades\Auth;
+use App\Models\User;
+use App\Models\Vendor;
+use App\Models\VendorTags;
+use App\Models\VendorLikes;
+use App\Models\Category;
+use App\Models\SubCategory;
+use App\Models\ItemGroup;
+use App\Models\Item;
+use App\Models\Notification;
+use App\Models\Status;
+use App\Models\Order;
+use App\Models\OrderUpdates;
+use App\Models\OrderItems;
+use DB;
+use Hash;
+use Mail;
+use JWTAuth;
+use Exception;
+use Storage;
+use Validator;
+use Tymon\JWTAuthExceptions\JWTException;
+date_default_timezone_set('Asia/Kolkata');
+ini_set('memory_limit','1024M');
+ini_set('max_execution_time', 1800); //30 mins, 300-5 mins
+use App\Http\Controllers\FCMNotificationConroller;
+
+class VendorController extends Controller
+{
+
+    public function __construct()
+    {
+        $this->middleware('jwt.auth', ['except' => ['getVendors','singleVendor','updateVendorsOpenClose']]);
+    }
+
+    /**
+     * 
+     * @return getVendors response
+     */
+    public function getVendors(Request $request)
+    {
+        //validation start
+        $validator = Validator::make($request->all(), ['offset' => 'required|numeric','limit' => 'required|numeric','category'=> 'required|numeric']);
+        if ($validator->fails()) {
+            return $this->sendBadException(implode(',',$validator->errors()->all()),null);
+        }
+        $offset = isset($request->offset)?$request->offset:0;
+        $limit = isset($request->limit)?$request->limit:10;
+        //validation end
+
+        $cat = Category::find($request->category);
+        if($cat==null){
+            return $this->sendBadException('category not found',null);
+        }
+
+        $vendors = Vendor::with('category','subCategory','offer')->where('categoryId',$request->category);
+        if(isset($request->pid)){
+            $vendors = $vendors->where('locationid',$request->pid);
+        }
+
+        if($request->header('Authorization'))
+        {
+            $user = JWTAuth::parseToken()->authenticate();
+            if($user->user_role!='ADMIN' && $user->user_role!='EDITOR' && $user->user_role!='OPERATOR')
+            {
+              $vendors = $vendors->where('is_active',1);
+            }
+        }else{
+            $user = null;
+            $vendors = $vendors->where('is_active',1);
+        }
+
+        $totalCount = Vendor::where([['categoryId',$request->category],['is_active',1]])->count();
+        $openCount = Vendor::where([['categoryId',$request->category],['is_open',1],['is_active',1]])->count();
+        $closeCount = Vendor::where([['categoryId',$request->category],['is_open',0],['is_active',1]])->count();
+
+
+        if(isset($request->subcategory) && $request->subcategory!=null)
+        {
+            $vendors = $vendors->where('sub_categoryId',$request->subcategory);
+        }
+
+        if(isset($request->is_open) && $request->is_open!=null)
+        {   
+            //$is_open = ($request->is_open==true)?1:0;
+            $vendors = $vendors->where('is_open',$request->is_open);
+        }
+
+        /* if(isset($request->is_active) && $request->is_active!=null)
+        {
+            $vendors = $vendors->where('is_active',$request->is_active);
+        }*/
+        if(isset($request->locationid)){
+        $vendors = $vendors->offset($offset)->where('locationid',$request->locationid)->limit($limit)->orderBy('display_order','ASC')->get(); 
+        }else{
+            $vendors = $vendors->offset($offset)->limit($limit)->orderBy('display_order','ASC')->get(); 
+ 
+        }
+
+        //arranging data from re-usable function
+        if(isset($request->isDetails) && $request->isDetails==1)
+        {
+            $vendorsInfo = $this->arrangeVendorData($vendors,$user,$request->isDetails);
+        }else{
+            $vendorsInfo = $this->arrangeVendorData($vendors,$user,null);
+        }
+        
+
+        //return $this->sendResponse($cat->name." vendor list",$vendorsInfo);
+        return response()->json(['status' => 'success','message' => $cat->name." vendor list",'totalCount'=>$totalCount,'openCount'  => $openCount,'closeCount' => $closeCount,'data' => $vendorsInfo], 200);
+    }
+
+    /**
+     * create createVendor.
+     * @return save response
+     */
+    public function createVendor(Request $request)
+    {
+        //start validations
+        $validator = Validator::make($request->all(), ['name' => 'required|string','address' => 'required|string','open_time'=>'required|date_format:h:i A','close_time'=>'required|date_format:h:i A','tags'=>'required','categoryId'=>'required']);
+        if ($validator->fails()) {
+            return $this->sendBadException(implode(',',$validator->errors()->all()),null);
+        }
+        //ends validations
+
+        $user = JWTAuth::parseToken()->authenticate();
+        if($user->user_role=='USER'){
+            return response()->json(["status"=>"error","message"=>"Sorry, You are not authorised to create vendor.",'data' => null],401);
+        }
+
+        //inserting post data
+        $post = new Vendor();
+        $post->name      = ($request->name!=null)?trim($request->name):null;
+        $post->description      = ($request->description!=null)?trim($request->description):null;
+        $post->lat     = ($request->lat!=null)?trim($request->lat):null;
+        $post->lng  = ($request->lng!=null)?trim($request->lng):null;
+        $post->address  = ($request->address!=null)?trim($request->address):null;
+        $post->tags  = (count($request->tags)>0)?implode(',',$request->tags):null;
+        $post->open_time  = ($request->open_time!=null)?trim($request->open_time):null;
+        $post->close_time  = ($request->close_time!=null)?trim($request->close_time):null;
+        $post->rating  = ($request->rating!=null)?trim($request->rating):null;
+        $post->website  = ($request->website!=null)?trim($request->website):null;
+        $post->percentage_to_chotu  = ($request->percentage_to_chotu!=null)?trim($request->percentage_to_chotu):null;
+        $post->categoryId  = $request->categoryId;
+        $post->sub_categoryId  = $request->sub_categoryId;
+        $post->postedBy  = $user->id;
+        $post->is_active = true;
+        $post->postedOn = date('Y-m-d H:i:s');
+        $post->delivery_time = ($request->delivery_time!=null)?trim($request->delivery_time):null;
+        $post->is_free_delivery = ($request->is_free_delivery!=null)?trim($request->is_free_delivery):null;
+
+        if(isset($request->accept_NotDeliveredOrders) && $request->accept_NotDeliveredOrders!=null){
+            $post->accept_NotDeliveredOrders = trim($request->accept_NotDeliveredOrders);
+        }
+
+        $post->original_item_tax = ($request->original_item_tax!=null)?trim($request->original_item_tax):null;
+        $post->payable_item_tax = ($request->payable_item_tax!=null)?trim($request->payable_item_tax):null;
+        $post->locationid=$request->locationid;
+        //adding mobile link to vendor
+        if(isset($request->mobile) && $request->mobile!=null)
+        {
+            $checkUser = User::where('mobile',$request->mobile)->first();
+            if($checkUser==null)
+            {
+                    $user = new User();
+                    $user->first_name      = 'Vendor';
+                    $user->last_name      = 'chotu';
+                    $user->user_role  = 'VENDOR';
+                    $user->mobile  = trim($request->mobile);
+                    $user->is_active = 1;
+                    $user->createdOn = date('Y-m-d H:i:s');
+                    $user->createdByAdmin = true; 
+                    $user->privilege = null;
+                    $user->save();
+            }else{
+                $checkUser->user_role = 'VENDOR';
+                $checkUser->update();
+            }
+            
+            $post->mobile = trim($request->mobile);
+        }else{
+            $post->mobile     = null;
+        }
+        //ends
+        
+
+        if(isset($request->license_no) && $request->license_no!=null){
+            $post->license_no = trim($request->license_no);
+        }
+        $post->save();
+        return $this->sendResponse("Vendor saved successfully...!",array("vendorId"=>$post->id));
+    }
+
+    /**
+     * single singleVendor.
+     * @return single post response
+     */
+    public function singleVendor(Request $requested, $id)
+    {
+        $request = array('id'=>$id);
+        $validator = Validator::make($request, ['id' => 'required|numeric']);
+        if ($validator->fails()) {
+            return $this->sendBadException(implode(',',$validator->errors()->all()),null);
+        }
+        //validation end
+
+        if($requested->header('Authorization')){
+            $user = JWTAuth::parseToken()->authenticate();
+        }else{
+            $user = null;
+        }
+
+        $vendor = Vendor::with('category','subCategory','offer')->find($id);
+        if($vendor==null){
+            return $this->sendBadException('Vendor not found',null);
+        }
+        /*if($vendor->is_active==0){
+            return $this->sendBadException('Sorry, Vendor is not Active',null);
+        }*/
+
+        //arranging vendor data from re-usable function
+        $vendor = $this->arrangeVendorData([$vendor],$user,null); //
+
+        return $this->sendResponse("single vendor",$vendor[0]);
+    }
+
+    /**
+     * edit Vendor.
+     * @return edit vendor response
+     */
+    public function editVendor(Request $request)
+    {
+        //start validations
+        $validator = Validator::make($request->all(), ['id' =>'required|numeric']); //'name' => 'required|string','address' => 'required|string','open_time'=>'required','close_time'=>'required','tags'=>'required','categoryId'=>'required'
+        if ($validator->fails()) {
+            return $this->sendBadException(implode(',',$validator->errors()->all()),null);
+        }
+
+        $vendor = Vendor::find($request->id);
+        if($vendor==null){
+            return $this->sendBadException('Vendor not found',null);
+        }
+
+        //logged user
+        $user = JWTAuth::parseToken()->authenticate();
+        if($user->user_role=='USER'){
+            return response()->json(["status"=>"error","message"=>"Sorry, You are not authorised to update vendor.",'data' => null],401);
+        }
+
+        if(isset($request->name) && $request->name!=null){
+            $vendor->name = trim($request->name);
+        }
+        if(isset($request->description) && $request->description!=null){
+            $vendor->description = trim($request->description);
+        }
+
+        if(isset($request->lat) && $request->lat!=null){
+            $vendor->lat = trim($request->lat);
+        }
+
+        if(isset($request->lng) && $request->lng!=null){
+            $vendor->lng = trim($request->lng);
+        }
+
+        if(isset($request->address) && $request->address!=null){
+            $vendor->address = trim($request->address);
+        }
+
+        if(isset($request->open_time)){
+            $vendor->open_time  = trim($request->open_time);
+        }
+        if(isset($request->close_time)){
+            $vendor->close_time  = trim($request->close_time);
+        }
+        if(isset($request->tags)){
+            $vendor->tags  = (count($request->tags)>0)?implode(',',$request->tags):null;
+        }
+        if(isset($request->website)){
+            $vendor->website  = trim($request->website);
+        }
+        if(isset($request->rating)){
+            $vendor->rating  = trim($request->rating);
+        }
+        if(isset($request->categoryId)){
+            $vendor->categoryId  = $request->categoryId;
+        }
+        if(isset($request->sub_categoryId)){
+            $vendor->sub_categoryId  = $request->sub_categoryId;
+        }
+        if(isset($request->is_active)){
+            $vendor->is_active  = $request->is_active;
+        }
+        if(isset($request->percentage_to_chotu)){
+            $vendor->percentage_to_chotu  = $request->percentage_to_chotu;
+        }
+
+        if(isset($request->delivery_time)){
+            $vendor->delivery_time  = $request->delivery_time;
+        }
+        if(isset($request->is_free_delivery)){
+            $vendor->is_free_delivery  = $request->is_free_delivery;
+        }
+
+        if(isset($request->accept_NotDeliveredOrders)){
+            $vendor->accept_NotDeliveredOrders = trim($request->accept_NotDeliveredOrders);
+        }
+
+        if(isset($request->original_item_tax)){
+            $vendor->original_item_tax = trim($request->original_item_tax);
+        }
+        if(isset($request->payable_item_tax)){
+            $vendor->payable_item_tax = trim($request->payable_item_tax);
+        }
+
+        //adding mobile link to vendor
+        if(isset($request->mobile) && $request->mobile!=null)
+        {
+            $checkUser = User::where('mobile',$request->mobile)->first();
+            if($checkUser==null)
+            {
+                    $user = new User();
+                    $user->first_name      = 'Vendor';
+                    $user->last_name      = 'chotu';
+                    $user->user_role  = 'VENDOR';
+                    $user->mobile  = trim($request->mobile);
+                    $user->is_active = 1;
+                    $user->createdOn = date('Y-m-d H:i:s');
+                    $user->createdByAdmin = true; 
+                    $user->privilege = null;
+                    $user->save();
+            }else{
+                $checkUser->user_role = 'VENDOR';
+                $checkUser->update();
+            }
+            
+            $vendor->mobile = trim($request->mobile);
+        }
+        //ends
+
+        if(isset($request->license_no) && $request->license_no!=null){
+            $vendor->license_no = trim($request->license_no);
+        }else{
+            $vendor->license_no = null;
+        }
+        
+
+        $vendor->updatedBy  = $user->id;
+        $vendor->updatedOn = date('Y-m-d H:i:s');
+        $vendor->update();
+
+        return $this->sendResponse("Vendor updated successfully...!",null);
+    }
+
+    public function vendorUpdateStatus(Request $request)
+    {
+        //start validations
+        $validator = Validator::make($request->all(), ['vendorId' =>'required|numeric','is_active'=>'required']);
+        if ($validator->fails()) {
+            return $this->sendBadException(implode(',',$validator->errors()->all()),null);
+        }
+
+        $vendor = Vendor::find($request->vendorId);
+        if($vendor==null){
+            return $this->sendBadException('Vendor not found',null);
+        }
+
+        //logged user
+        $user = JWTAuth::parseToken()->authenticate();
+        if($user->user_role=='USER'){
+            return response()->json(["status"=>"error","message"=>"Sorry, You are not authorised to update vendor.",'data' => null],401);
+        }
+
+        if(isset($request->is_active)){
+            $vendor->is_active  = $request->is_active;
+        }
+
+        $vendor->updatedBy  = $user->id;
+        $vendor->updatedOn = date('Y-m-d H:i:s');
+        $vendor->update();
+
+        return $this->sendResponse("Vendor Status Updated successfully...!",array("vendorId"=>$request->vendorId,"is_active"=>$request->is_active));
+    }
+
+    /**
+     * delete vendor
+     * @return delete vendor response
+     */
+    public function deleteVendor($id)
+    {
+        $request = array('id'=>$id);
+        $validator = Validator::make($request, ['id' => 'required|numeric']);
+        if ($validator->fails()) {
+            return $this->sendBadException(implode(',',$validator->errors()->all()),null);
+        }
+        //validation end
+
+        $v = Vendor::find($id);
+        if($v==null){
+            return $this->sendBadException('Vendor not found',null);
+        }
+
+        //find loggend user
+        $user = JWTAuth::parseToken()->authenticate();
+        //checking post delete permission
+        if($user->user_role=='USER'){
+            return response()->json(["status"=>"error","message"=>"Sorry, You are not authorised to delete vendor.",'data' => null],401);
+        }
+        $v->is_active = 0; 
+        $v->update();
+
+        return $this->sendResponse("vendor deleted successfully",null);
+    }
+
+    /**
+     * vendorImageUpdate
+     * @return upload pic response
+     */
+    public function vendorImageUpdate(Request $request)
+    {   
+        //file extension validations based on image
+        $validator = Validator::make($request->all(),
+                            ['image' => 'required|mimes:jpeg,png,jpg|max:10000','image.required' => 'Please upload an image',
+                             'image.mimes' => 'Only jpeg,png,jpg images are allowed',
+                             'image.max' => 'Sorry! Maximum allowed size for an image is 10MB',
+                             'vendorId'=> 'required|numeric']);
+        if ($validator->fails()) {
+            return $this->sendBadException(implode(',',$validator->errors()->all()),null);
+        }
+
+        $vendor = Vendor::find($request->vendorId);
+        if($vendor==null)
+        {
+            return $this->sendBadException('Vendor not found',null);
+        }
+
+        //auth user
+        $user = JWTAuth::parseToken()->authenticate();
+
+        $file = $request->file('image');
+        $extension = $file->getClientOriginalExtension();
+        $destination_file_name = time().".".$extension;
+
+        if($extension==null || $extension=="" || $extension==" ")
+        {
+            return $this->sendBadException('Image properties are not valid',null);
+        }
+
+        $fileName = sha1(date('YmdHis') . str_random(30)).$file->getClientOriginalName();
+        $destinationPath = public_path().'/images/hotels/' ;
+        $file->move($destinationPath,$fileName);
+
+        
+        $vendor->media = $fileName;
+        $vendor->update();  
+
+        return $this->sendResponse("Image updated..!",array("url"=>request()->getSchemeAndHttpHost().'/images/hotels/'.$fileName));  
+    }
+
+    public function displaySequence(Request $request)
+    {
+        //start validations
+        $validator = Validator::make($request->all(), ['displaySequence' =>'required|Array']);
+        if ($validator->fails()) {
+            return $this->sendBadException(implode(',',$validator->errors()->all()),null);
+        }
+
+        //logged user
+        $user = JWTAuth::parseToken()->authenticate();
+        if($user->user_role=='USER'){
+            return response()->json(["status"=>"error","message"=>"Sorry, You are not authorised to update vendors.",'data' => null],401);
+        }
+
+        foreach ($request->displaySequence as $data) 
+        {
+            $vendor = Vendor::find($data['vendorId']);
+            if($vendor==null){
+                return $this->sendBadException('Vendor not found',null);
+            }
+            $vendor->display_order = $data['display_order'];
+            $vendor->update();
+            
+        }
+    
+        return $this->sendResponse("Vendor Status Updated successfully...!",array("displaySequence"=>$request->displaySequence));
+    }
+
+    public function vendorReport(Request $request)
+    {
+        //start validations
+        $validator = Validator::make($request->all(), ['dates' =>'required|Array','vendorId'=>'required']);
+        if ($validator->fails()) {
+            return $this->sendBadException(implode(',',$validator->errors()->all()),null);
+        }
+
+        //logged user
+        $user = JWTAuth::parseToken()->authenticate();
+        if($user->user_role=='USER'){
+            return response()->json(["status"=>"error","message"=>"Sorry, You are not authorised to access",'data' => null],401);
+        }
+
+        $vendor = Vendor::find($request->vendorId);
+        if($vendor==null){
+            return $this->sendBadException('Vendor not found',null);
+        }
+
+
+        if( count($request->dates)=='2' )
+        {   
+            $from = $request->dates[0]." 00:00:00";
+            $to = $request->dates[1]." 23:59:59";
+        }else{
+            $from = $request->dates[0]." 00:00:00";
+            $to = $request->dates[0]." 23:59:59";
+        }
+
+        //counts fetching
+        $order_counts = array();
+        $getStatuses = Status::all();
+
+        $order_counts['total_Orders'] = Order::where('vendorId',$vendor->id)->whereBetween('createdOn', [$from, $to])->count();
+
+        foreach ($getStatuses as $stl) 
+        {
+            
+            $order_counts[$stl->name] = Order::where([['vendorId',$vendor->id],['status',$stl->id]])->whereBetween('createdOn', [$from, $to])->count();
+        }
+        //ends
+
+        //return $order_counts;
+
+        $totalOrdersPrice = array(); 
+        $vendorItemsPrice = array(); 
+        $deliveryFee = array(); 
+        $discountPrice = array();
+        $comission = array();
+        $c =array();  
+
+        $orders = Order::where([['vendorId',$vendor->id]])
+                        ->whereBetween('createdOn', [$from, $to])
+                        ->whereIn('status',[4,16])
+                        ->get();
+
+        foreach ($orders as $v) 
+        {
+            array_push($totalOrdersPrice, $v->finalPrice);
+            array_push($vendorItemsPrice, $v->itemsPrice);
+            array_push($deliveryFee, $v->deliveryFee);
+            array_push($discountPrice, $v->discountPrice);
+            //daily and hourly vendor can change commision to chotu
+            //$perctg1 = $v->itemsPrice - ($v->itemsPrice*($v->apnachotu_commision/100));
+            //array_push($comission, $perctg1);
+
+            $c1 = ($v->itemsPrice*($v->apnachotu_commision/100));
+            array_push($comission, $c1);
+            
+        }
+
+        //return $comission;
+        $vendorItemsPrice = array_sum($vendorItemsPrice);
+        $comission = array_sum($comission);
+        $discountPrice = array_sum($discountPrice);
+
+        /*if($vendor->percentage_to_chotu!=null){
+            $perctg = $vendorItemsPrice - ($vendorItemsPrice*($vendor->percentage_to_chotu/100));
+        }else{
+            $perctg = $vendorItemsPrice;
+        }*/
+
+        $order_counts['settlements'] = array(
+        "totalOrdersPrice"=> array_sum($totalOrdersPrice),
+        "itemsPrice"=> $vendorItemsPrice,
+        "deliveryFee"=> 0,//array_sum($deliveryFee),
+        "discountPrice"=> $discountPrice,
+        'comission' => round($comission,2),
+        "finalVendorAmount"=> round($vendorItemsPrice - $comission - $discountPrice,2),
+        "currentPercentageToChotu"=>$vendor->percentage_to_chotu);
+
+        //unset($vendor->percentage_to_chotu);
+
+        /*$res['dates'] = $request->date;
+        $res['vendor'] = $vendor;
+
+        $findSatment = Sattlements::where([['sattlementForId',$vendor->id],['dates',$request->date]])->first();
+
+        if(count($orders)>0)
+        {
+                if($findSatment==null){
+                    $add_satlements = new Sattlements();
+                    $add_satlements->dates = $request->date;
+                    $add_satlements->sattlementFor = 'VENDOR';
+                    $add_satlements->sattlementForId = $vendor->id;
+                    $add_satlements->paymentMode = 'CASH';
+                    $add_satlements->status = 'PENDING';
+                    $add_satlements->sattlements = json_encode($settlements);
+                    $add_satlements->orders = json_encode($orders);
+                    $add_satlements->createdOn = date('Y-m-d H:i:s');
+                    $add_satlements->save();
+                    $res['settlementStatus'] = 'PENDING';
+                    $res['settlementId'] = $add_satlements->id;
+                    $res['paymentMode'] = null;
+                    $res['settlements'] = $settlements;
+                    $res['orders'] = $orders;
+                }else{
+                    $add_satlements = Sattlements::find($findSatment->id);
+                    //$add_satlements->paymentMode = 'CASH';
+                    //$add_satlements->status = 'PENDING';
+                    if($add_satlements->status!='DONE'){
+                        $add_satlements->sattlements = json_encode($settlements);
+                        $add_satlements->orders = json_encode($orders);
+                        $add_satlements->updatedOn = date('Y-m-d H:i:s');
+                        $add_satlements->update();
+                        $res['settlementStatus'] = $add_satlements->status;
+                        $res['settlementId'] = $add_satlements->id;
+                        $res['paymentMode'] = null;
+                        $res['settlements'] = $settlements;
+                        $res['orders'] = $orders;
+                    }else{
+                        $res['settlementStatus'] = $add_satlements->status;
+                        $res['settlementId'] = $add_satlements->id;
+                        $res['paymentMode'] = $add_satlements->paymentMode;
+                        $res['settlements'] = json_decode($add_satlements->sattlements);
+                        $res['orders'] = json_decode($add_satlements->orders);
+                    }
+                    
+                }
+            }*/
+    
+        return $this->sendResponse("Vendor Report...!",$order_counts);
+    }
+
+
+/********* Private / ReUsable functions here************/
+    public function imageFilesCompress($source, $destination, $quality)
+    {
+        $info = getimagesize($source);
+
+        if ($info['mime'] == 'image/jpeg' || $info['mime'] == 'image/jpg')
+        {
+            $image = imagecreatefromjpeg($source);
+            imagejpeg($image, $destination, $quality);
+        }elseif ($info['mime'] == 'image/gif') {
+            $image = imagecreatefromgif($source);
+            imagetruecolortopalette($image, false, 16);  //  compress to 16 colors in gif palette (change 16 to anything between 1-256)
+            imagegif($image, $destination);
+            //imagegif($image, $destination, $quality);
+        }elseif ($info['mime'] == 'image/png') {
+            $image = imagecreatefrompng($source);
+            imageAlphaBlending($image, true);
+            imageSaveAlpha($image, true);
+            // chang to png quality
+            $png_quality = 9 - round(($quality / 100 ) * 9 );
+            imagePng($image, $destination, $png_quality);
+        }
+        //imagejpeg($image, $destination, $quality);
+        //Free up memory
+        imagedestroy($image);
+
+        return $destination;
+    }
+
+    //compress image code
+    private function compressImage($source_url, $destination_url, $quality)
+    {
+
+        //$quality :: 0 - 100
+        if($destination_url == null || $destination_url == "" ){
+           $destination_url = $source_url;
+        }
+
+        $info = getimagesizefromstring($source_url);
+
+        $image = imagecreatefromstring($source_url);
+
+        if ($info['mime'] == 'image/jpeg' || $info['mime'] == 'image/jpg' || $info['mime'] == 'image/gif')
+        {
+            //ranges from 0 (worst quality, smaller file) to 100 (best quality, biggest file). The default is quality value (about 75).
+            imagejpeg($image, $destination_url, $quality);
+        }
+        elseif ($info['mime'] == 'image/png')
+        {
+            imageAlphaBlending($image, true);
+            imageSaveAlpha($image, true);
+            /* chang to png quality */
+            $png_quality = 9 - round(($quality / 100 ) * 9 );
+            imagePng($image, $destination_url, $png_quality); //Compression level: from 0 (no compression) to 9(full compression).
+        }
+        else{
+            return FALSE;
+        }
+        //Free up memory
+        imagedestroy($image);
+
+        return $destination_url;
+    }
+
+    public function uploadMedia($file_data,$folder,$id,$extension)
+    {
+
+        $uploadPath = $folder."/".$id."/".time().rand(10,10000).".".$extension;
+
+        $insert_in_s3 = Storage::disk('s3')->put($uploadPath,$file_data, 'public');
+        if($insert_in_s3 == false){
+            return false;
+        }
+        $s3_image_path = Storage::disk('s3')->url($uploadPath);
+        return $s3_image_path;
+    }
+
+    public function updateVendorsOpenClose()
+    {
+        $vendors = Vendor::all();
+        foreach ($vendors as $v) 
+        {
+            
+            $vend = Vendor::find($v->id);
+
+            $now = new \Datetime("now");
+            $begintime = new \DateTime(strtolower($vend->open_time));
+            $endtime = new \DateTime(strtolower($vend->close_time));
+            $vend->is_open = true;
+            // if($now >= $begintime && $now <= $endtime){
+            //     // between times
+            //     $vend->is_open = true;
+            // } else {
+            //     // not between times
+            //     $vend->is_open = false;
+            // }
+            $vend->update();
+        }
+        return "updated";
+    }
+
+    //common function for dashboard , single post and shared post
+    public function arrangeVendorData($vendors,$loggedUser=null,$isDetails=null)
+    {
+        foreach ($vendors as $value)
+        {   
+            //check hotel is open or not based on current time
+                /*$now = new \Datetime("now");
+                $begintime = new \DateTime(strtolower($value->open_time));
+                $endtime = new \DateTime(strtolower($value->close_time));
+
+                if($now >= $begintime && $now <= $endtime){
+                    // between times
+                    $value->is_open = true;
+                } else {
+                    // not between times
+                    $value->is_open = false;
+                }*/
+            //ends
+
+            unset($value->postedBy);
+            unset($value->updatedBy);
+            unset($value->updatedOn);
+            unset($value->postedOn);
+            unset($value->sub_categoryId);
+            unset($value->categoryId);
+
+            $value->media = ($value->media!=null)?request()->getSchemeAndHttpHost().'/images/hotels/'.$value->media:null;
+
+            $value->is_open = ($value->is_open==1)?true:false;
+
+            //fetching tag_people
+            $tags = array();
+            if($isDetails==null || $isDetails=='0')
+            {
+                if($value->tags!=null)
+                {
+                    $arr = explode(",",$value->tags);
+                    foreach ($arr as $ar) {
+                        $tags[] = VendorTags::where('id',$ar)->select(['id', 'name'])->first();
+                    }
+                } 
+            }
+            $value->tags = $tags;
+
+            $value->is_free_delivery = ($value->is_free_delivery==1)?true:false;
+
+            if($isDetails==null || $isDetails=='0')
+            {
+
+
+                //logged user liked or not
+                if($loggedUser==null){
+
+                    $value->user_liked = false;
+
+                    $itemGroups = ItemGroup::where([['vendorId',$value->id],['is_active',1]])->select('id','name as group','is_active')->get();
+                }else{
+
+                    $is_liked = VendorLikes::where([['is_liked',true],['vendorId',$value->id],['userId',$loggedUser->id]])->count();
+                    $value->user_liked = ($is_liked>0)?true:false;
+
+                    if($loggedUser->user_role=='USER')
+                    {
+                        $itemGroups = ItemGroup::where([['vendorId',$value->id],['is_active',1]])->select('id','name as group','is_active')->get();
+                    }else
+                    {
+                        $itemGroups = ItemGroup::where([['vendorId',$value->id]])->select('id','name as group','is_active')->get();
+                    }
+                }
+
+                if(count($itemGroups)>0){
+                    foreach ($itemGroups as $group) {
+
+                        if($loggedUser==null)
+                        {
+
+                            $g_items = Item::where([['item_groupId',$group->id],['is_active',1]])->select('id','name','price','updated_item_price','price_quantity','item_price_history','rating','type','count','orderPrice','ratingCount','is_active','price_quantity','image')->get();
+                        }else{
+
+                            if($loggedUser->user_role=='USER')
+                            {
+                                $g_items = Item::where([['item_groupId',$group->id],['is_active',1]])->select('id','name','price','updated_item_price','price_quantity','item_price_history','rating','type','count','orderPrice','ratingCount','is_active','price_quantity','image')->get();
+                            }else
+                            {
+                                $g_items = Item::where([['item_groupId',$group->id]])->select('id','name','price','updated_item_price','price_quantity','item_price_history','rating','type','count','orderPrice','ratingCount','is_active','image')->get();
+                            }
+                        }
+
+                        foreach ($g_items as $g_i) {
+                           // return $g_i;
+                            if($g_i->price_quantity!=null)
+                            {
+                                $price_q = json_decode($g_i->price_quantity);
+                                foreach ($price_q as $p) {
+                                    if(!isset($p->updated_item_price))
+                                    {
+                                        $p->updated_item_price = $p->price;
+                                    }
+                                    
+                                }
+                                $g_i->price_quantity = $price_q;
+
+                            }else{
+                                $g_i->price_quantity = null;
+                                $g_i->updated_item_price = ($g_i->updated_item_price==0)?$g_i->price:$g_i->updated_item_price;
+                            }
+
+
+
+                            if($g_i->item_price_history!=null)
+                            {   
+                                //sort inner array based on values
+                                    $item_price_history = json_decode($g_i->item_price_history);
+                                    usort($item_price_history, function($a, $b) { 
+                                        return $a->updatedOn > $b->updatedOn ? -1 : 1; //Compare the scores
+                                    });
+                                //ends here 
+                                $g_i->item_price_history = $item_price_history;
+                            }else{
+                                $g_i->item_price_history = [];
+                            }
+
+
+
+
+                            $g_i->image = ($g_i->image!=null)?request()->getSchemeAndHttpHost().'/images/items/'.$g_i->image:null;
+
+                        }
+
+                        $group->items = $g_items;
+                    }
+                    $value->menu = $itemGroups;
+                }else{
+                    $value->menu = [];
+                }
+            }else{
+                $value->menu = [];
+            }
+        }
+        return $vendors;
+    }
+
+
+}
